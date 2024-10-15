@@ -1,0 +1,371 @@
+from tensorflow.keras.callbacks import *
+from tensorflow.keras.layers import Input, Dense, Conv2D, concatenate
+from tensorflow.keras.models import Model
+
+
+input_size = (256, 256, 3)
+patch_size = (8, 8) # Segment 28-by-28 frames into 2-by-2 sized patches, patch contents and positions are embedded
+n_labels = 10 # MNIST labels
+
+# Dropout parameters
+mlp_drop_rate = 0.01 # Droupout after each MLP layer
+attn_drop_rate = 0.01 # Dropout after Swin-Attention
+proj_drop_rate = 0.01 # Dropout at the end of each Swin-Attention block, i.e., after linear projections
+drop_path_rate = 0.01 # Drop-path within skip-connections
+
+# Self-attention parameters
+num_heads = 8 # Number of attention heads
+embed_dim = 64 # Number of embedded dimensions
+num_mlp = 256 # Number of MLP nodes
+qkv_bias = True # Convert embedded patches to query, key, and values with a learnable additive value
+qk_scale = None # None: Re-scale query based on embed dimensions per attention head # Float for user specified scaling factor
+
+# Shift-window parameters
+window_size = 2 # Size of attention window (height = width)
+shift_size = window_size // 2 
+num_patch_x = input_size[0]//patch_size[0]
+num_patch_y = input_size[1]//patch_size[1]
+
+IN = Input(input_size)
+X = IN
+
+# Extract patches from the input tensor
+X = patch_extract(patch_size)(X)
+
+# Embed patches to tokens
+X = patch_embedding(num_patch_x*num_patch_y, embed_dim)(X)
+
+# Swin transformers
+# Stage 1: window-attention + Swin-attention + patch-merging
+
+for i in range(2):
+
+    if i % 2 == 0:
+        shift_size_temp = 0
+    else:
+        shift_size_temp = shift_size
+
+    X = SwinTransformerBlock(dim=embed_dim, num_patch=(num_patch_x, num_patch_y), num_heads=num_heads, window_size=window_size,
+                             shift_size=shift_size_temp, num_mlp=num_mlp, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                             mlp_drop=mlp_drop_rate, attn_drop=attn_drop_rate, proj_drop=proj_drop_rate, drop_path_prob=drop_path_rate,
+                             name='swin_block{}'.format(i))(X)
+# Patch-merging
+X = patch_merging((num_patch_x, num_patch_y), embed_dim=embed_dim, name='down{}'.format(i))(X)
+
+
+# Convert embedded tokens (2D) to vectors (1D)
+X = GlobalAveragePooling1D()(X)
+
+# The output section
+OUT = Dense(n_labels, activation='softmax')(X)
+
+## Section
+def swin_transformer_stack(X, stack_num, embed_dim, num_patch, num_heads, window_size, num_mlp, shift_window=True, name=''):
+
+    # Turn-off dropouts
+    mlp_drop_rate = 0 
+    attn_drop_rate = 0 
+    proj_drop_rate = 0 
+    drop_path_rate = 0 
+
+    qkv_bias = True 
+    qk_scale = None 
+
+    if shift_window:
+        shift_size = window_size // 2
+    else:
+        shift_size = 0
+
+    for i in range(stack_num):
+
+        if i % 2 == 0:
+            shift_size_temp = 0
+        else:
+            shift_size_temp = shift_size
+
+        X = SwinTransformerBlock(dim=embed_dim,
+                                 num_patch=num_patch,
+                                 num_heads=num_heads,
+                                 window_size=window_size,
+                                 shift_size=shift_size_temp,
+                                 num_mlp=num_mlp,
+                                 qkv_bias=qkv_bias,
+                                 qk_scale=qk_scale,
+                                 mlp_drop=mlp_drop_rate,
+                                 attn_drop=attn_drop_rate,
+                                 proj_drop=proj_drop_rate,
+                                 drop_path_prob=drop_path_rate,
+                                 name='name{}'.format(i))(X)
+    return X
+
+
+def swin_block(input_tensor, filter_num_begin, depth, stack_num_down, stack_num_up,
+                      patch_size, num_heads, window_size, num_mlp, shift_window=True, name='swin_unet'):
+
+    # Compute number be patches to be embeded
+    input_size = input_tensor.shape.as_list()[1:]
+    num_patch_x = input_size[0]//patch_size[0]
+    num_patch_y = input_size[1]//patch_size[1]
+
+    # Number of Embedded dimensions
+    embed_dim = filter_num_begin
+
+    depth_ = depth
+
+    X_skip = []
+
+    X = input_tensor
+
+    # Patch extraction
+    X = patch_extract(patch_size)(X)
+
+    # Embed patches to tokens
+    X = patch_embedding(num_patch_x*num_patch_y, embed_dim)(X)
+
+    # The first Swin Transformer stack
+    X = swin_transformer_stack(X,
+                               stack_num=stack_num_down,
+                               embed_dim=embed_dim,
+                               num_patch=(num_patch_x, num_patch_y),
+                               num_heads=num_heads[0],
+                               window_size=window_size[0],
+                               num_mlp=num_mlp,
+                               shift_window=shift_window,
+                               name='{}_swin_down0'.format(name))
+    X_skip.append(X)
+
+    # Downsampling blocks
+    for i in range(depth_-1):
+
+        # Patch merging
+        X = patch_merging((num_patch_x, num_patch_y), embed_dim=embed_dim, name='down{}'.format(i))(X)
+
+        # update token shape info
+        embed_dim = embed_dim*2
+        num_patch_x = num_patch_x//2
+        num_patch_y = num_patch_y//2
+
+        # Swin Transformer stacks
+        X = swin_transformer_stack(X,
+                                   stack_num=stack_num_down,
+                                   embed_dim=embed_dim,
+                                   num_patch=(num_patch_x, num_patch_y),
+                                   num_heads=num_heads[i+1],
+                                   window_size=window_size[i+1],
+                                   num_mlp=num_mlp,
+                                   shift_window=shift_window,
+                                   name='{}_swin_down{}'.format(name, i+1))
+
+        # Store tensors for concat
+        X_skip.append(X)
+
+    # reverse indexing encoded tensors and hyperparams
+    X_skip = X_skip[::-1]
+    num_heads = num_heads[::-1]
+    window_size = window_size[::-1]
+
+    # upsampling begins at the deepest available tensor
+    X = X_skip[0]
+
+    # other tensors are preserved for concatenation
+    X_decode = X_skip[1:]
+
+    depth_decode = len(X_decode)
+
+    for i in range(depth_decode):
+
+        # Patch expanding
+        X = patch_expanding(num_patch=(num_patch_x, num_patch_y), embed_dim=embed_dim, upsample_rate=2, return_vector=True)(X)
+
+
+        # update token shape info
+        embed_dim = embed_dim//2
+        num_patch_x = num_patch_x*2
+        num_patch_y = num_patch_y*2
+
+        # Concatenation and linear projection
+        X = concatenate([X, X_decode[i]], axis=-1, name='{}_concat_{}'.format(name, i))
+        X = Dense(embed_dim, use_bias=False, name='{}_concat_linear_proj_{}'.format(name, i))(X)
+
+        # Swin Transformer stacks
+        X = swin_transformer_stack(X,
+                                   stack_num=stack_num_up,
+                                   embed_dim=embed_dim,
+                                   num_patch=(num_patch_x, num_patch_y),
+                                   num_heads=num_heads[i],
+                                   window_size=window_size[i],
+                                   num_mlp=num_mlp,
+                                   shift_window=shift_window,
+                                   name='{}_swin_up{}'.format(name, i))
+
+    X = patch_expanding(num_patch=(num_patch_x, num_patch_y), embed_dim=embed_dim, upsample_rate=patch_size[0], return_vector=False)(X)
+
+    return X
+
+
+
+def spa_atten(enc_feat, dec_feat):
+    cnct = concatenate([enc_feat, dec_feat], axis=-1)
+    enc_line1 = AveragePooling2D(pool_size=(2, 2), strides=(1, 1), padding="same")(cnct)
+    enc_line2 = MaxPooling2D(pool_size=(2, 2), strides=(1, 1), padding="same")(cnct)
+
+    cnct2 = concatenate([enc_line1, enc_line2], axis=-1)
+
+    enc_line = Conv2D(filters=1, kernel_size=(1, 1), activation=None, padding='same',
+                      kernel_initializer='glorot_normal', bias_initializer=Constant(0.1))(cnct2)
+
+    dec_line = Conv2D(filters=1, kernel_size=(1, 1), activation=None, padding='same',
+                      kernel_initializer='glorot_normal', bias_initializer=Constant(0.1))(dec_feat)
+
+    out = sigmoid(enc_line)
+    out = multiply([out, enc_feat])
+    out = add([out, dec_line])
+
+    return out
+
+
+def cha_atten(enc_feat, dec_feat, filters):
+    enc_line_a = AveragePooling2D(pool_size=(2, 2), strides=(1, 1),  padding="same")(enc_feat)
+    enc_line_m = MaxPooling2D(pool_size=(2, 2),  strides=(1, 1),     padding="same")(enc_feat)
+
+    cnct1 = concatenate([enc_line_a, enc_line_m], axis=-1)
+
+    enc_line_a = Conv2D(filters=filters,    kernel_size=(1, 1), activation=None,  padding='same',
+                        kernel_initializer='glorot_normal', bias_initializer=Constant(0.1))(cnct1)
+    enc_line_m = Conv2D(filters=filters,    kernel_size=(1, 1), activation=None,  padding='same',
+                        kernel_initializer='glorot_normal', bias_initializer=Constant(0.1))(cnct1)
+    enc_line = add([enc_line_a, enc_line_m])
+
+    out_a = sigmoid(enc_line)
+    out_a = multiply([enc_feat, out_a ])
+
+    out_a = Conv2D(filters=filters, kernel_size=(1, 1), activation='sigmoid', padding='same',
+                 kernel_initializer='glorot_normal', bias_initializer=Constant(0.1))(out_a)
+
+    return out_a
+
+
+def spa_cha_atten_gate(enc_feat, dec_feat, filters):
+
+    spa_aten_gate = spa_atten(enc_feat, dec_feat)
+    cha_aten_gate = cha_atten(spa_aten_gate, spa_aten_gate, filters)
+
+    out = Conv2D(filters=filters, kernel_size=(3, 3), activation='relu', padding='same',
+                 kernel_initializer='glorot_normal', bias_initializer=Constant(0.1))(cha_aten_gate)
+
+    return out
+
+
+def conv_block(input, filters):
+    x = Conv2D(filters, kernel_size=(3, 3), activation='relu', padding='same', kernel_initializer='glorot_normal',
+               bias_initializer=Constant(0.1))(input)
+    x = Conv2D(filters, kernel_size=(3, 3), activation='relu', padding='same', kernel_initializer='glorot_normal',
+               bias_initializer=Constant(0.1))(x)
+    x = BatchNormalization(epsilon=1e-3, beta_initializer=Constant(0.0), gamma_initializer=Constant(1.0),
+                           momentum=0.5)(x)
+    return x
+
+
+def bottleneck_block(input, filters):
+    x = Conv2D(filters, kernel_size=(3, 3), activation='relu', padding='same', kernel_initializer='glorot_normal',
+               bias_initializer=Constant(0.1))(input)
+    x = Conv2D(filters, kernel_size=(3, 3), activation='relu', padding='same', kernel_initializer='glorot_normal',
+               bias_initializer=Constant(0.1))(x)
+    x = BatchNormalization(epsilon=1e-3, beta_initializer=Constant(0.0), gamma_initializer=Constant(1.0),
+                           momentum=0.5)(x)
+    return x
+
+
+def robust_residual_block(input, filt):
+    axis_is = int(3)
+    xa_0 = Conv2D(filters=filt, kernel_size=(1,1), padding='same',activation='relu',
+                  kernel_initializer='glorot_normal', bias_initializer=Constant(0.1))(input)
+    bn_0 = tfa.layers.GroupNormalization(groups=filt, axis=axis_is)(xa_0)
+
+
+    xa_1 = Conv2D(filters=filt, kernel_size=(3,3), padding='same',activation='relu',
+                  kernel_initializer='glorot_normal', bias_initializer=Constant(0.1))(bn_0)
+    bn_1 = tfa.layers.GroupNormalization(groups=filt, axis=axis_is)(xa_1)
+
+
+    xa_2 = Conv2D(filters=filt, kernel_size=(1,1), padding='same',activation='relu',
+                  kernel_initializer='glorot_normal',bias_initializer=Constant(0.1))(bn_1)
+    bn_2 = tfa.layers.GroupNormalization(groups=filt, axis=axis_is)(xa_2)
+
+
+    xb_0 = Conv2D(filters=filt, kernel_size=(1,1), padding='same',activation='relu',
+                  kernel_initializer='glorot_normal',bias_initializer=Constant(0.1))(input)
+    bn_3 = tfa.layers.GroupNormalization(groups=filt, axis=axis_is)(xb_0)
+
+    x = add([bn_2,bn_3])
+    
+    return x
+
+
+def gen_attn_cnn(inputs_rec, input_shape=(256, 256, 3), filters = [16, 32, 64, 128]):
+    inputs = inputs_rec
+    filters = filters
+
+    r_conv1 = robust_residual_block(inputs, filters[0])
+    pool = MaxPooling2D( (2, 2), strides=(2, 2), padding="same")(r_conv1)
+
+    r_conv2 = robust_residual_block(pool, filters[1])
+    pool = MaxPooling2D( (2, 2), strides=(2, 2), padding="same")(r_conv2)
+
+    r_conv3 = robust_residual_block(pool, filters[2])
+    pool = MaxPooling2D( (2, 2), strides=(2, 2), padding="same")(r_conv3)
+
+    r_conv4 = robust_residual_block(pool, filters[3])
+    pool = MaxPooling2D( (2, 2), strides=(2, 2), padding="same")(r_conv4)
+
+    r_conv5 = bottleneck_block(pool, filters[4])
+
+    up_sam_1 = UpSampling2D((2, 2))( r_conv5)
+    up_conv1 = spa_cha_atten_gate(r_conv4, up_sam_1, filters[3])
+
+    up_sam_2 = UpSampling2D((2, 2))(up_conv1)
+    up_conv2 = spa_cha_atten_gate(r_conv3, up_sam_2, filters[2])
+
+    up_sam_3 = UpSampling2D((2, 2))(up_conv2)
+    up_conv3 = spa_cha_atten_gate(r_conv2, up_sam_3, filters[1])
+
+    up_sam_4 = UpSampling2D((2, 2))(up_conv3)
+    up_conv4 = spa_cha_atten_gate(r_conv1, up_sam_4, filters[0])
+
+    outputs = Conv2D(1, kernel_size=(1, 1), strides=(1, 1), activation='sigmoid', padding='same')(up_conv4)
+
+    return outputs
+
+
+def mans_net_model():
+    filter_num_begin = 128     
+    depth = 4                  
+    stack_num_down = 2         
+    stack_num_up = 2           
+    patch_size = (4, 4)        
+    num_heads = [4, 8, 8, 8]  
+    window_size = [4, 2, 2, 2] 
+    num_mlp = 512              
+    shift_window=True          
+
+    input_size = (256, 256, 3)
+    IN = Input(input_size)
+
+    X = swin_block(IN, filter_num_begin, depth, stack_num_down, stack_num_up,
+                          patch_size, num_heads, window_size, num_mlp,
+                          shift_window=shift_window, name='swin_block')
+
+    Y = gen_attn_cnn(inputs_rec=IN)
+
+    n_labels = 1
+    OUT_1 = Conv2D(16, kernel_size=3, use_bias=False, padding='same', activation='relu')(X)
+    cnct1 = concatenate([OUT_1, Y], axis=-1)
+    OUT = Conv2D(16, kernel_size=3, use_bias=False, padding='same', activation='relu')(cnct1)
+    OUT = Conv2D(1, kernel_size=1, use_bias=False, padding='same', activation='sigmoid')(OUT)
+
+    model = Model(inputs=[IN,], outputs=[OUT,])
+
+    opt = tf.keras.optimizers.Adam(learning_rate=4e-4, clipvalue=0.001)
+    model.compile(loss=tf.keras.losses.binary_crossentropy, optimizer=opt)
+    model.summary()
+    return model
